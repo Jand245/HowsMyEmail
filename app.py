@@ -8,11 +8,6 @@ st.caption("Demo UI for email input , model output , risk score and recommendati
 
 st.header("1. Input")
 
-analysis_mode = st.radio(
-    "Analysis Mode",
-    ["Single Email", "Batch / Inbox"],
-    horizontal=True
-)
 
 input_mode = st.radio(
     "Choose input method",
@@ -35,7 +30,7 @@ else:
         st.success("File uploaded successfully.")
 
 model_input = {
-    "mode": "single" if analysis_mode == "Single Email" else "batch",
+    
     "emails": [
         {
             "to": "",
