@@ -1,21 +1,13 @@
-def analyze_email(email_text):
+def analyze_email(email_input):
     """
-    Temporary model interface.
-    Later, replace the fake values with real classifier output.
+    Placeholder for the real model.
+
+   
     """
 
     return {
         "risk_score": 72,
-        "risk_level": "High",
-        "flagged_emails": 1,
-        "recommendation": "Review carefully before clicking links, opening attachments, or replying.",
-        "breakdown": [
-            {
-                "email": "Email 1",
-                "risk_score": 72,
-                "risk_level": "High",
-                "reason": "Placeholder: suspicious language, urgency, or links detected",
-                "recommendation": "Verify sender before interacting"
-            }
-        ]
+        "most_received_emails": "technology",
+        "mailbox_targeted": "malicious",
+        "recommendation": "Do not interact with this email until the sender and links are verified."
     }
