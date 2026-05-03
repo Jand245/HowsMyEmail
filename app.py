@@ -1,12 +1,18 @@
 import streamlit as st
 from model_runner import analyze_email
 
-st.set_page_config(page_title="Email Risk Analyzer", layout="wide")
+st.set_page_config(page_title="HowsMyEmail", layout="wide")
 
-st.title("Email Social Engineering Risk Analyzer")
+st.title("HowsMyEmail")
 st.caption("Demo UI for email input , model output , risk score and recommendation")
 
 st.header("1. Input")
+
+analysis_mode = st.radio(
+    "Analysis Mode",
+    ["Single Email", "Batch / Inbox"],
+    horizontal=True
+)
 
 input_mode = st.radio(
     "Choose input method",
@@ -29,14 +35,19 @@ else:
         st.success("File uploaded successfully.")
 
 model_input = {
-    "to": "",
-    "from": "",
-    "subject": "",
-    "header": "",
-    "encryption": False,
-    "body": email_text,
-    "signature": "",
-    "attachment": False
+    "mode": "single" if analysis_mode == "Single Email" else "batch",
+    "emails": [
+        {
+            "to": "",
+            "from": "",
+            "subject": "",
+            "header": "",
+            "encryption": False,
+            "body": email_text,
+            "signature": "",
+            "attachment": False
+        }
+    ]
 }
 
 st.header("2. Analysis")
@@ -66,9 +77,6 @@ if run_analysis:
 
             st.subheader("Recommendation")
             st.info(recommendation)
-
-            st.subheader("Raw Model Output")
-            st.json(result)
 
         except Exception as e:
             st.error("Model analysis failed.")
