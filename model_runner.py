@@ -3,7 +3,6 @@ import torch
 import json
 import re
 
-
 MODEL_PATH = "./merged"
 
 print("Loading tokenizer...")
@@ -12,13 +11,10 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 print("Loading model...")
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_PATH,
-    dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-    
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
 )
 
-
 model.to("cuda" if torch.cuda.is_available() else "cpu")
-
 model.eval()
 print("Model loaded.\n")
 
@@ -26,186 +22,206 @@ print("Model loaded.\n")
 def clean_json_response(response):
     response = response.strip()
 
-    # remove markdown fences
     response = re.sub(r"^```json", "", response)
     response = re.sub(r"^```", "", response)
     response = re.sub(r"```$", "", response)
 
     response = response.strip()
 
-    # extract JSON block
-    match = re.search(r"\{.*\}", response, re.DOTALL)
-    if match:
-        return match.group(0)
+    array_match = re.search(r"\[.*\]", response, re.DOTALL)
+    if array_match:
+        return array_match.group(0)
+
+    object_match = re.search(r"\{.*\}", response, re.DOTALL)
+    if object_match:
+        return object_match.group(0)
 
     return response
 
 
+def extract_label_objects(response):
+    """
+    Backup parser for when the model starts valid JSON
+    but over-generates or gets cut off.
+    """
+
+    objects = []
+
+    pattern = r'\{\s*"risk_tier"\s*:\s*.*?"tags"\s*:\s*\{\s*"layer_2"\s*:\s*\[.*?\]\s*,\s*"layer_3"\s*:\s*\[.*?\]\s*,\s*"layer_4"\s*:\s*\[.*?\]\s*,\s*"layer_5"\s*:\s*\[.*?\]\s*\}\s*\}'
+
+    matches = re.findall(pattern, response, re.DOTALL)
+
+    for match in matches:
+        try:
+            objects.append(json.loads(match))
+        except json.JSONDecodeError:
+            pass
+
+    return objects
+
+
 def analyze_email(email_input):
-    # send full inbox instead of one email
     email_text = json.dumps(email_input["emails"], indent=2)
 
     prompt = f"""
-    You are a cybersecurity analyst specializing in social engineering detection.
+You are labeling emails for a cybersecurity social engineering dataset.
 
-You will receive a list of emails.
+You will receive a small batch of email objects.
 
-You must treat each email as an independent case.
-Do not merge emails.
-Do not average behavior mentally.
-
-Your task is to estimate the probability that each email is malicious using structured reasoning, then compute a final inbox-level score.
-
-BATCH PROCESSING REQUIREMENT
-
-
-First, count how many email objects are in the input list. Call this number N.
-
-Process the batch as N separate emails.
-
-For each email object in the list:
-- score that email
-- assign that email one domain_tag
-- assign that email layer tags
-- add one score to email_scores
-- add one object to email_results
-
-The inbox_score is calculated only after all N email scores exist.
-
---------------------------------
-PER-EMAIL SCORING PROCESS
---------------------------------
-
-Assign a base probability using the risk tier:
-tier_1_benign = 0.10
-tier_2_dark_pattern = 0.35
-tier_3_manipulative = 0.60
-tier_4_malicious = 0.85
-
-Risk tier definitions:
-tier_1_benign = normal communication with no clear manipulation, deception, or harmful intent.
-tier_2_dark_pattern = persuasive, pressured, or nudging behavior without clear evidence of malicious intent.
-tier_3_manipulative = deceptive or coercive social engineering with clear manipulation, but without fully explicit malicious outcome.
-tier_4_malicious = clear credential theft, account takeover, financial fraud, malware delivery, identity theft, extortion, or scam intent.
-
-Update this probability using observed evidence from the email:
-
-Layer 4 signals: increase probability by 0.10 to 0.25 each  
-Layer 5 signals: increase probability by 0.05 to 0.15 each  
-Layer 3 signals: increase probability by 0.02 to 0.08 each  
-Layer 2 signals: increase probability by 0.01 to 0.05 each  
-
-Use higher values for strong, explicit signals and lower values for weak or implied ones.
-
-Important calibration rules:
-- If an email asks the user to click a link and verify credentials, it must be at least tier_3_manipulative.
-- If urgency + account threat + credential verification are present, it should usually be tier_4_malicious.
-- Do not assign tier_4 without clear harmful intent.
-- Do not inflate benign emails due to mild urgency alone.
-
-Apply diminishing returns:
-As probability approaches 1.0, reduce the impact of additional signals.
-
-Combine weak signals conservatively:
-Do not over-sum many small indicators.
-
-Cap probability at 0.99.
-
-Convert to a score:
-
-final_score = (probability × 100 × 0.7) + (tier_base × 100 × 0.3)
-
---------------------------------
-TAGGING OUTPUT ADDITION
---------------------------------
-
-For each email, also return the domain and layer tags used for that email.
-
-Each email must have exactly one domain_tag.
-
-Domain tag options:
-political, financial, technology, health, education, employment, legal, news_media, marketing, personal_emotional, religious, social_community
-
-Layer fields must always be arrays.
-Use empty arrays if no tags apply.
-
-Layer 2 examples:
-tec_account_takeover_bait, tec_support_impersonation, tec_software_lure, tec_cloud_share_lure,
-fin_account_threat, fin_payment_request, fin_reward_lure,
-emp_payroll_manipulation, emp_recruiter_impersonation,
-edu_credential_phishing,
-leg_authority_impersonation, leg_lawsuit_threat, leg_copyright_threat,
-per_romance_manipulation, per_shame_extortion,
-soc_charity_fraud
-
-Layer 3 examples:
-urgency_pressure, fear_threat, authority_appeal, curiosity_bait, emotional_exploitation, greed_reward, personalization, commitment_escalation
-
-Layer 4 examples:
-credential_harvest, account_takeover, financial_fraud, data_exfiltration, identity_theft, malware_delivery, behavioral_manipulation
-
-Layer 5 examples:
-spoofed_sender, lookalike_domain, suspicious_url, risky_attachment, auth_fail, thread_hijack
-
---------------------------------
-INBOX AGGREGATION
---------------------------------
-
-After scoring all emails individually:
-
-- Compute the average of all email scores
-- Identify the maximum (highest) email score
-
-Then compute the final inbox score:
-
-inbox_score = (average × 0.6) + (max × 0.4)
-
-Rationale:
-- The average represents overall inbox risk
-- The maximum preserves the impact of the most dangerous email
-- The weighting ensures high-risk emails do not disappear into the average
-
---------------------------------
-INPUT
---------------------------------
-
-Emails:
-{email_text}
-
---------------------------------
-OUTPUT
---------------------------------
-
-Return valid JSON only.
-Do not use markdown.
-
-Return exactly this structure:
+Each email object uses this format:
 
 {{
-  "risk_tier" : "inbox_level",
-  "inbox_score": 0,
-  "email_scores": [0],
-  "email_results": [
-    {{
-      "score": 0,
-      "domain_tag": "technology",
+  "to": "",
+  "from": "",
+  "subject": "",
+  "header": "",
+  "encryption": false,
+  "body": "",
+  "signature": "",
+  "attachment": false
+}}
+
+Your job is to evaluate each email object independently and assign labels using only the schema below.
+
+For each email:
+1. Read the subject, header, body, sender, signature, attachment value, and encryption value.
+2. Choose exactly one risk_tier.
+3. Choose exactly one domain_tag.
+4. Choose any supported layer tags from layer_2, layer_3, layer_4, and layer_5.
+5. Leave a layer array empty only when no valid tag from that layer fits the email.
+
+Return one label object per input email.
+Return labels in the same order as the input emails.
+
+OUTPUT FORMAT
+
+Return only valid JSON.
+Return a JSON array.
+Do not include markdown.
+Do not include explanations.
+Do not include email_1, email_2, or any invented domain names.
+
+The output array length must equal the number of input email objects.
+If there are 5 input emails, return exactly 5 output objects.
+Do not split one email into multiple labels.
+Do not create extra labels.
+Stop immediately after the final closing ].
+
+Each output object must follow this exact shape:
+
+[
+  {{
+    "risk_tier": "tier_1_benign",
+    "domain_tag": "technology",
+    "tags": {{
       "layer_2": [],
       "layer_3": [],
       "layer_4": [],
       "layer_5": []
     }}
-  ],
-  "reason": "brief explanation of overall inbox risk and any high-risk emails"
-}}
+  }}
+]
 
-Important:
-- email_scores must contain one score per input email.
-- email_results must contain one object per input email.
-- email_results must be in the same order as the input emails.
-- score inside email_results must match the matching value in email_scores.
-- layer_2, layer_3, layer_4, and layer_5 must always be arrays.
-- domain_tag must always be exactly one string.
+VALID domain_tag VALUES
+political
+financial
+health
+religious
+marketing
+education
+technology
+social_community
+employment
+legal
+news_media
+personal_emotional
 
+VALID risk_tier VALUES
+tier_1_benign
+tier_2_dark_pattern
+tier_3_manipulative
+tier_4_malicious
+
+VALID layer_2 TAGS
+pol_voting_manipulation: fake voting deadlines or suppression
+pol_donation_pressure: urgent political donation pressure
+pol_disinformation_spread: encourages spreading false political information
+fin_account_threat: banking account suspension or unusual activity
+fin_payment_request: payment invoice wire or billing request
+fin_reward_lure: refund prize cashback or money bait
+fin_investment_bait: unrealistic investment return
+hlt_fear_induction: illness exposure medical scare
+hlt_product_scam: fake cure supplement or treatment
+hlt_data_harvest: fake medical portal collecting data
+rel_guilt_obligation: moral or spiritual pressure
+rel_donation_manipulation: fake religious charity donation
+rel_community_impersonation: posing as religious leader
+mkt_false_scarcity: fake limited stock or countdown
+mkt_misleading_claim: exaggerated or false offer
+mkt_dark_pattern: deceptive marketing or unsubscribe pattern
+mkt_fake_loyalty_bait: fake loyalty reward expiration
+edu_scholarship_scam: fake scholarship grant or award
+edu_fake_certification: fake or unaccredited certificate
+edu_awareness_impersonation: fake school IT or security notice
+tec_account_takeover_bait: fake login OTP or account alert
+tec_support_impersonation: fake IT Microsoft Google or support help
+tec_software_lure: fake software update or install prompt
+tec_cloud_share_lure: fake Drive Dropbox or document share
+soc_peer_pressure: others already verified or joined
+soc_charity_fraud: fake charity appeal
+soc_fake_survey: survey used for data collection
+soc_community_threat: local alert used as bait
+emp_fake_job_offer: unrealistic job offer
+emp_recruiter_impersonation: fake recruiter or HR
+emp_application_harvest: collects applicant data
+emp_payroll_manipulation: direct deposit or payroll change
+leg_lawsuit_threat: fake lawsuit or legal threat
+leg_copyright_threat: fake copyright or DMCA threat
+leg_compliance_bait: fake compliance policy update
+leg_authority_impersonation: fake government or legal authority
+nws_fake_breaking_news: fabricated urgent news
+nws_clickbait_headline: outrage or curiosity headline
+nws_confirmation_bias: reinforces beliefs deceptively
+nws_share_amplification: urges forwarding or sharing
+per_romance_manipulation: fake relationship manipulation
+per_grief_crisis_exploit: grief or crisis exploitation
+per_shame_extortion: shame blackmail or sextortion
+per_savior_bait: urgent appeal to save or help someone
+
+VALID layer_3 TAGS
+urgency_pressure: deadline or immediate action pressure
+fear_threat: threat consequence danger punishment
+guilt_shame: obligation blame shame pressure
+greed_reward: prize gain refund reward
+social_proof: others already did it
+reciprocity: we helped now you owe
+curiosity_bait: click to see hidden information
+false_scarcity: limited availability or countdown
+personalization: uses personal details
+emotional_exploitation: leverages emotions
+
+VALID layer_4 TAGS
+credential_harvest: login password MFA OTP theft
+financial_fraud: payment wire invoice gift card scam
+malware_delivery: malicious attachment or download
+data_exfiltration: collects sensitive data
+account_takeover: account access or session compromise
+identity_theft: collects identity information
+disinformation: spreads false information
+behavioral_manipulation: deceptive influence of user action
+extortion_blackmail: threats for compliance or payment
+
+VALID layer_5 TAGS
+spoofed_sender: sender mismatch or impersonation
+lookalike_domain: fake domain mimicking real one
+auth_fail: SPF DKIM DMARC failure
+suspicious_url: risky mismatched or action link
+risky_attachment: executable macro or suspicious file
+thread_hijack: inserted into existing thread
+
+INPUT EMAILS
+
+{email_text}
 """
 
     messages = [{"role": "user", "content": prompt}]
@@ -225,7 +241,9 @@ Important:
         outputs = model.generate(
             **inputs,
             max_new_tokens=900,
-            do_sample=False
+            do_sample=False,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id
         )
 
     response = tokenizer.decode(
@@ -238,25 +256,15 @@ Important:
     try:
         result = json.loads(cleaned)
     except json.JSONDecodeError:
-        raise ValueError(f"Model did not return valid JSON:\n{response}")
+        result = extract_label_objects(response)
 
-    # Convert 0–1 → 0–100
-    if "inbox_score" in result and result["inbox_score"] <= 1:
-        result["inbox_score"] = round(result["inbox_score"] * 100)
+        if not result:
+            raise ValueError(f"Model did not return valid JSON:\n{response}")
 
-    if "email_scores" in result:
-        result["email_scores"] = [
-            round(score * 100) if score <= 1 else round(score)
-            for score in result["email_scores"]
-        ]
+    if isinstance(result, dict):
+        result = [result]
 
-    if "email_results" in result:
-        for email in result["email_results"]:
-            if "score" in email and email["score"] <= 1:
-                email["score"] = round(email["score"] * 100)
-
-    # normalize risk tier
-    if result.get("risk_tier") == "4":
-        result["risk_tier"] = "tier_4_malicious"
+    expected_count = len(email_input["emails"])
+    result = result[:expected_count]
 
     return result

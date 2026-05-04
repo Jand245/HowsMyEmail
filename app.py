@@ -12,13 +12,11 @@ st.title("HowsMyEmail")
 st.caption("Demo interface for analyzing email social engineering risk")
 
 st.header("1. Input")
-
 st.write("Paste a JSON list of emails, or paste multiple plain-text emails separated by `---` or starting with `Subject:`.")
 
 email_text = st.text_area("Paste inbox content here", height=300)
 
 st.header("2. Analysis")
-
 st.write("The local model connects through `model_runner.py`.")
 
 run_analysis = st.button("Run Analysis")
@@ -31,15 +29,102 @@ def chunk_list(items, size):
         yield items[i:i + size]
 
 
-def score_to_tier(score):
+def score_label(label):
+
+    tier_aliases = {
+        1: "tier_1_benign",
+        2: "tier_2_dark_pattern",
+        3: "tier_3_manipulative",
+        4: "tier_4_malicious",
+        "1": "tier_1_benign",
+        "2": "tier_2_dark_pattern",
+        "3": "tier_3_manipulative",
+        "4": "tier_4_malicious",
+    }
+
+    tier_base_map = {
+        "tier_1_benign": 0.10,
+        "tier_2_dark_pattern": 0.35,
+        "tier_3_manipulative": 0.60,
+        "tier_4_malicious": 0.85,
+    }
+
+    risk_tier = label.get("risk_tier", "tier_1_benign")
+    tier_base = tier_base_map.get(risk_tier, 0.10)
+
+    probability = tier_base
+    tags = label.get("tags", {})
+
+    increments = {
+        "layer_4": 0.18,
+        "layer_5": 0.10,
+        "layer_3": 0.05,
+        "layer_2": 0.03,
+    }
+
+    for layer_name in ["layer_4", "layer_5", "layer_3", "layer_2"]:
+        layer_tags = tags.get(layer_name, [])
+
+        if isinstance(layer_tags, str):
+            layer_tags = [layer_tags]
+
+        for _ in layer_tags:
+            probability += increments[layer_name] * (1 - probability)
+
+    probability = min(probability, 0.99)
+
+    final_score = (probability * 100 * 0.7) + (tier_base * 100 * 0.3)
+
+    return round(max(0, min(final_score, 100)))
+
+
+def score_to_mailbox_targeted(score):
     if score < 25:
-        return "tier_1_benign"
+        return "benign"
     elif score < 50:
-        return "tier_2_dark_pattern"
+        return "dark pattern"
     elif score < 75:
-        return "tier_3_manipulative"
+        return "manipulative"
     else:
-        return "tier_4_malicious"
+        return "malicious"
+
+
+def recommendation_for(score):
+    if score < 25:
+        return "Mailbox appears mostly safe. Continue normal caution."
+    elif score < 50:
+        return "Some persuasive or dark-pattern emails are present. Review before clicking links."
+    elif score < 75:
+        return "Mailbox shows manipulative social engineering patterns. Verify senders and avoid quick actions."
+    else:
+        return "High-risk mailbox. Do not click links or open attachments until suspicious emails are reviewed."
+
+
+def normalize_email(raw_email, index):
+    if isinstance(raw_email, dict):
+        return {
+            "id": raw_email.get("id", f"email_{index}"),
+            "to": raw_email.get("to", ""),
+            "from": raw_email.get("from", ""),
+            "subject": raw_email.get("subject", ""),
+            "header": raw_email.get("header", ""),
+            "encryption": raw_email.get("encryption", False),
+            "body": raw_email.get("body", ""),
+            "signature": raw_email.get("signature", ""),
+            "attachment": raw_email.get("attachment", False),
+        }
+
+    return {
+        "id": f"email_{index}",
+        "to": "",
+        "from": "",
+        "subject": "",
+        "header": "",
+        "encryption": False,
+        "body": str(raw_email),
+        "signature": "",
+        "attachment": False,
+    }
 
 
 if run_analysis:
@@ -47,11 +132,16 @@ if run_analysis:
         st.warning("Paste an email or inbox first.")
     else:
         try:
-            emails = json.loads(email_text)
+            parsed = json.loads(email_text)
 
-            if not isinstance(emails, list):
+            if not isinstance(parsed, list):
                 st.error("JSON input must be a list of emails.")
                 st.stop()
+
+            emails = [
+                normalize_email(email, index)
+                for index, email in enumerate(parsed, start=1)
+            ]
 
         except json.JSONDecodeError:
             if "---" in email_text:
@@ -75,34 +165,19 @@ if run_analysis:
                 ]
 
             else:
-                email_bodies = [
-                    email_text.strip()
-                ]
+                email_bodies = [email_text.strip()]
 
-            emails = []
-
-            for body in email_bodies:
-                emails.append(
-                    {
-                        "to": "",
-                        "from": "",
-                        "subject": "",
-                        "header": "",
-                        "encryption": False,
-                        "body": body,
-                        "signature": "",
-                        "attachment": False
-                    }
-                )
+            emails = [
+                normalize_email(body, index)
+                for index, body in enumerate(email_bodies, start=1)
+            ]
 
         st.write(f"Detected emails: {len(emails)}")
 
-        all_email_scores = []
-        all_email_results = []
+        all_labels = []
         batch_outputs = []
 
         batches = list(chunk_list(emails, BATCH_SIZE))
-
         progress = st.progress(0)
 
         with st.spinner("Analyzing inbox in batches..."):
@@ -113,55 +188,58 @@ if run_analysis:
                     "emails": batch
                 }
 
-                batch_result = analyze_email(model_input)
-                batch_outputs.append(batch_result)
+                batch_labels = analyze_email(model_input)
 
-                batch_scores = batch_result.get("email_scores", [])
-                batch_results = batch_result.get("email_results", [])
+                if isinstance(batch_labels, dict):
+                    batch_labels = [batch_labels]
 
-                all_email_scores.extend(batch_scores)
-                all_email_results.extend(batch_results)
+                batch_outputs.append(batch_labels)
+                all_labels.extend(batch_labels)
 
                 progress.progress(batch_index / len(batches))
 
-        if all_email_scores:
-            average_score = sum(all_email_scores) / len(all_email_scores)
-            max_score = max(all_email_scores)
+        email_scores = [score_label(label) for label in all_labels]
 
-            inbox_score = round((average_score * 0.6) + (max_score * 0.4))
-            inbox_tier = score_to_tier(inbox_score)
-
+        if email_scores:
+            average_score = sum(email_scores) / len(email_scores)
+            max_score = max(email_scores)
+            risk_score = round((average_score * 0.6) + (max_score * 0.4))
         else:
-            inbox_score = 0
-            inbox_tier = "unknown"
+            risk_score = 0
 
         domain_counts = Counter()
         layer_counts = Counter()
 
-        for email_result in all_email_results:
-            domain = email_result.get("domain_tag")
+        for label in all_labels:
+            domain = label.get("domain_tag")
             if domain:
                 domain_counts[domain] += 1
 
+            tags = label.get("tags", {})
             for layer_name in ["layer_2", "layer_3", "layer_4", "layer_5"]:
-                tags = email_result.get(layer_name, [])
+                layer_tags = tags.get(layer_name, [])
 
-                if isinstance(tags, str):
-                    tags = [tags]
+                if isinstance(layer_tags, str):
+                    layer_tags = [layer_tags]
 
-                for tag in tags:
+                for tag in layer_tags:
                     layer_counts[tag] += 1
 
         most_common_domain = domain_counts.most_common(1)
         most_common_layer = layer_counts.most_common(1)
 
+        most_received_emails = most_common_domain[0][0] if most_common_domain else "none"
+        mailbox_targeted = score_to_mailbox_targeted(risk_score)
+        recommendation = recommendation_for(risk_score)
+
         final_result = {
-            "risk_tier": inbox_tier,
-            "inbox_score": inbox_score,
-            "email_scores": all_email_scores,
-            "most_common_domain": most_common_domain[0] if most_common_domain else ("none", 0),
+            "risk score": risk_score,
+            "most received emails": most_received_emails,
+            "mailbox targeted": mailbox_targeted,
+            "recommendation": recommendation,
+            "email_scores": email_scores,
+            "labels": all_labels,
             "most_common_layer_tag": most_common_layer[0] if most_common_layer else ("none", 0),
-            "reason": f"Scored {len(all_email_scores)} emails in batches of {BATCH_SIZE}. Final inbox score uses 60% average risk and 40% highest email risk.",
             "batch_outputs": batch_outputs
         }
 
@@ -169,24 +247,23 @@ if run_analysis:
 
         col1, col2, col3 = st.columns(3)
 
-        col1.metric("Inbox Risk Tier", final_result["risk_tier"])
-        col2.metric("Inbox Score", final_result["inbox_score"])
-        col3.metric("Emails Scored", len(all_email_scores))
+        col1.metric("Risk Score", final_result["risk score"])
+        col2.metric("Mailbox Targeted", final_result["mailbox targeted"])
+        col3.metric("Emails Scored", len(email_scores))
 
         col4, col5 = st.columns(2)
 
-        domain_name, domain_count = final_result["most_common_domain"]
-        layer_name, layer_count = final_result["most_common_layer_tag"]
+        col4.metric("Most Received Emails", final_result["most received emails"])
 
-        col4.metric("Most Common Domain", f"{domain_name} ({domain_count})")
+        layer_name, layer_count = final_result["most_common_layer_tag"]
         col5.metric("Most Common Layer Tag", f"{layer_name} ({layer_count})")
 
-        st.write("Reason:")
-        st.write(final_result["reason"])
+        st.write("Recommendation:")
+        st.write(final_result["recommendation"])
 
         st.subheader("Individual Email Scores")
 
-        for i, score in enumerate(all_email_scores, start=1):
+        for i, score in enumerate(email_scores, start=1):
             st.write(f"Email {i}: {score}")
 
         st.subheader("Raw Output")
