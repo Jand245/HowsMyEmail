@@ -3,6 +3,7 @@ import torch
 import json
 import re
 
+
 MODEL_PATH = "./merged"
 
 print("Loading tokenizer...")
@@ -12,8 +13,11 @@ print("Loading model...")
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_PATH,
     dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-    device_map="auto"
+    
 )
+
+
+model.to("cuda" if torch.cuda.is_available() else "cpu")
 
 model.eval()
 print("Model loaded.\n")
@@ -38,16 +42,39 @@ def clean_json_response(response):
 
 
 def analyze_email(email_input):
-    email_text = email_input["emails"][0]["body"]
+    # send full inbox instead of one email
+    email_text = json.dumps(email_input["emails"], indent=2)
 
-    
     prompt = f"""
-    
-You are a cybersecurity analyst specializing in social engineering detection.
+    You are a cybersecurity analyst specializing in social engineering detection.
 
-Your task is to estimate the probability that an email is malicious using structured reasoning.
+You will receive a list of emails.
 
-You must follow this exact process:
+You must treat each email as an independent case.
+Do not merge emails.
+Do not average behavior mentally.
+
+Your task is to estimate the probability that each email is malicious using structured reasoning, then compute a final inbox-level score.
+
+BATCH PROCESSING REQUIREMENT
+
+
+First, count how many email objects are in the input list. Call this number N.
+
+Process the batch as N separate emails.
+
+For each email object in the list:
+- score that email
+- assign that email one domain_tag
+- assign that email layer tags
+- add one score to email_scores
+- add one object to email_results
+
+The inbox_score is calculated only after all N email scores exist.
+
+--------------------------------
+PER-EMAIL SCORING PROCESS
+--------------------------------
 
 Assign a base probability using the risk tier:
 tier_1_benign = 0.10
@@ -63,118 +90,173 @@ tier_4_malicious = clear credential theft, account takeover, financial fraud, ma
 
 Update this probability using observed evidence from the email:
 
-Each signal increases probability within a bounded range. The exact increase should be chosen based on how strong, clear, and direct the signal is in the email.
+Layer 4 signals: increase probability by 0.10 to 0.25 each  
+Layer 5 signals: increase probability by 0.05 to 0.15 each  
+Layer 3 signals: increase probability by 0.02 to 0.08 each  
+Layer 2 signals: increase probability by 0.01 to 0.05 each  
 
-Layer 4 signals: increase probability by 0.10 to 0.25 each
-
-Use values near 0.10 for weak or implied signals.
-Use values near 0.25 for clear, direct, high-confidence signals.
-
-Layer 5 signals: increase probability by 0.05 to 0.15 each
-
-Lower values for ambiguous or partial indicators.
-Higher values for strong, clearly observable indicators.
-
-Layer 3 signals: increase probability by 0.02 to 0.08 each
-
-Lower values for subtle or weak persuasion.
-Higher values for explicit or aggressive persuasion.
-
-Layer 2 signals: increase probability by 0.01 to 0.05 each
-
-Lower values for general categorization.
-Higher values for clearly defined attack patterns.
+Use higher values for strong, explicit signals and lower values for weak or implied ones.
 
 Important calibration rules:
-If the email asks the user to click a link and verify credentials, it must be at least tier_3_manipulative.
-If the email combines urgency, account threat, and credential verification, it should usually be tier_4_malicious.
-If the email contains a suspicious or lookalike link plus credential/account verification language, it should usually be tier_4_malicious.
-Do not label an email tier_4_malicious unless there is clear harmful intent or a clear harmful outcome.
-Do not inflate benign marketing or ordinary reminders just because they contain mild urgency.
+- If an email asks the user to click a link and verify credentials, it must be at least tier_3_manipulative.
+- If urgency + account threat + credential verification are present, it should usually be tier_4_malicious.
+- Do not assign tier_4 without clear harmful intent.
+- Do not inflate benign emails due to mild urgency alone.
 
 Apply diminishing returns:
-As probability approaches 1.0, reduce the impact of additional signals so the score increases more slowly.
+As probability approaches 1.0, reduce the impact of additional signals.
 
 Combine weak signals conservatively:
-If multiple weak or moderate signals exist, do not sum them aggressively.
-Avoid inflating probability from many low-impact features.
+Do not over-sum many small indicators.
 
-Cap the final probability at 0.99.
+Cap probability at 0.99.
 
-Convert the result into a final confidence score using this formula:
+Convert to a score:
 
 final_score = (probability × 100 × 0.7) + (tier_base × 100 × 0.3)
 
-Where:
-tier_base is the starting probability from step 1.
+--------------------------------
+TAGGING OUTPUT ADDITION
+--------------------------------
 
-Round to the nearest integer and keep the result between 0 and 100.
+For each email, also return the domain and layer tags used for that email.
 
-Email to analyze:
+Each email must have exactly one domain_tag.
+
+Domain tag options:
+political, financial, technology, health, education, employment, legal, news_media, marketing, personal_emotional, religious, social_community
+
+Layer fields must always be arrays.
+Use empty arrays if no tags apply.
+
+Layer 2 examples:
+tec_account_takeover_bait, tec_support_impersonation, tec_software_lure, tec_cloud_share_lure,
+fin_account_threat, fin_payment_request, fin_reward_lure,
+emp_payroll_manipulation, emp_recruiter_impersonation,
+edu_credential_phishing,
+leg_authority_impersonation, leg_lawsuit_threat, leg_copyright_threat,
+per_romance_manipulation, per_shame_extortion,
+soc_charity_fraud
+
+Layer 3 examples:
+urgency_pressure, fear_threat, authority_appeal, curiosity_bait, emotional_exploitation, greed_reward, personalization, commitment_escalation
+
+Layer 4 examples:
+credential_harvest, account_takeover, financial_fraud, data_exfiltration, identity_theft, malware_delivery, behavioral_manipulation
+
+Layer 5 examples:
+spoofed_sender, lookalike_domain, suspicious_url, risky_attachment, auth_fail, thread_hijack
+
+--------------------------------
+INBOX AGGREGATION
+--------------------------------
+
+After scoring all emails individually:
+
+- Compute the average of all email scores
+- Identify the maximum (highest) email score
+
+Then compute the final inbox score:
+
+inbox_score = (average × 0.6) + (max × 0.4)
+
+Rationale:
+- The average represents overall inbox risk
+- The maximum preserves the impact of the most dangerous email
+- The weighting ensures high-risk emails do not disappear into the average
+
+--------------------------------
+INPUT
+--------------------------------
+
+Emails:
 {email_text}
 
-Return only valid JSON.
-Do not include markdown.
-Do not include explanations outside the JSON.
+--------------------------------
+OUTPUT
+--------------------------------
+
+Return valid JSON only.
+Do not use markdown.
 
 Return exactly this structure:
+
 {{
-  "risk_tier": "tier_1_benign | tier_2_dark_pattern | tier_3_manipulative | tier_4_malicious",
-  "confidence": 0,
-  "reason": "brief explanation of the strongest evidence"
+  "risk_tier" : "inbox_level",
+  "inbox_score": 0,
+  "email_scores": [0],
+  "email_results": [
+    {{
+      "score": 0,
+      "domain_tag": "technology",
+      "layer_2": [],
+      "layer_3": [],
+      "layer_4": [],
+      "layer_5": []
+    }}
+  ],
+  "reason": "brief explanation of overall inbox risk and any high-risk emails"
 }}
 
-The risk_tier value must be exactly one of:
-tier_1_benign
-tier_2_dark_pattern
-tier_3_manipulative
-tier_4_malicious
+Important:
+- email_scores must contain one score per input email.
+- email_results must contain one object per input email.
+- email_results must be in the same order as the input emails.
+- score inside email_results must match the matching value in email_scores.
+- layer_2, layer_3, layer_4, and layer_5 must always be arrays.
+- domain_tag must always be exactly one string.
 
-The confidence value must be the final_score from the scoring process.
-
-
-    Email to analyze:
-    {email_text}
-    """
+"""
 
     messages = [{"role": "user", "content": prompt}]
 
-    # apply chat template
     prompt_text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True
     )
 
-    # tokenize
     inputs = tokenizer(
         prompt_text,
         return_tensors="pt"
     ).to(model.device)
 
-    # generate
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=150,
+            max_new_tokens=900,
             do_sample=False
         )
 
-    # decode
     response = tokenizer.decode(
         outputs[0][inputs["input_ids"].shape[-1]:],
         skip_special_tokens=True
     ).strip()
 
-    # clean
     cleaned = clean_json_response(response)
 
-    # parse JSON
     try:
-        return json.loads(cleaned)
-    except:
-        return {
-            "risk_tier": "unknown",
-            "confidence": 0,
-            "reason": response
-        }
+        result = json.loads(cleaned)
+    except json.JSONDecodeError:
+        raise ValueError(f"Model did not return valid JSON:\n{response}")
+
+    # Convert 0–1 → 0–100
+    if "inbox_score" in result and result["inbox_score"] <= 1:
+        result["inbox_score"] = round(result["inbox_score"] * 100)
+
+    if "email_scores" in result:
+        result["email_scores"] = [
+            round(score * 100) if score <= 1 else round(score)
+            for score in result["email_scores"]
+        ]
+
+    if "email_results" in result:
+        for email in result["email_results"]:
+            if "score" in email and email["score"] <= 1:
+                email["score"] = round(email["score"] * 100)
+
+    # normalize risk tier
+    if result.get("risk_tier") == "4":
+        result["risk_tier"] = "tier_4_malicious"
+
+    return result
