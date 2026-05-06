@@ -19,6 +19,79 @@ model.eval()
 print("Model loaded.\n")
 
 
+TAG_DESCRIPTIONS = {
+    "pol_voting_manipulation": "Fake voting deadlines or suppression.",
+    "pol_donation_pressure": "Urgent political donation pressure.",
+    "pol_disinformation_spread": "Encourages spreading false political information.",
+    "fin_account_threat": "Banking account suspension or unusual activity threat.",
+    "fin_payment_request": "Payment, invoice, wire, or billing request.",
+    "fin_reward_lure": "Refund, prize, cashback, or money bait.",
+    "fin_investment_bait": "Unrealistic investment return.",
+    "hlt_fear_induction": "Illness, exposure, or medical scare.",
+    "hlt_product_scam": "Fake cure, supplement, or treatment.",
+    "hlt_data_harvest": "Fake medical portal collecting data.",
+    "rel_guilt_obligation": "Moral or spiritual pressure.",
+    "rel_donation_manipulation": "Fake religious charity donation.",
+    "rel_community_impersonation": "Posing as a religious leader.",
+    "mkt_false_scarcity": "Fake limited stock or countdown.",
+    "mkt_misleading_claim": "Exaggerated or false offer.",
+    "mkt_dark_pattern": "Deceptive marketing or unsubscribe pattern.",
+    "mkt_fake_loyalty_bait": "Fake loyalty reward expiration.",
+    "edu_scholarship_scam": "Fake scholarship, grant, or award.",
+    "edu_fake_certification": "Fake or unaccredited certificate.",
+    "edu_awareness_impersonation": "Fake school IT or security notice.",
+    "tec_account_takeover_bait": "Fake login, OTP, or account alert.",
+    "tec_support_impersonation": "Fake IT, Microsoft, Google, or support help.",
+    "tec_software_lure": "Fake software update or install prompt.",
+    "tec_cloud_share_lure": "Fake Drive, Dropbox, or document share.",
+    "soc_peer_pressure": "Claims others already verified or joined.",
+    "soc_charity_fraud": "Fake charity appeal.",
+    "soc_fake_survey": "Survey used for data collection.",
+    "soc_community_threat": "Local alert used as bait.",
+    "emp_fake_job_offer": "Unrealistic job offer.",
+    "emp_recruiter_impersonation": "Fake recruiter or HR message.",
+    "emp_application_harvest": "Collects applicant data.",
+    "emp_payroll_manipulation": "Direct deposit or payroll change.",
+    "leg_lawsuit_threat": "Fake lawsuit or legal threat.",
+    "leg_copyright_threat": "Fake copyright or DMCA threat.",
+    "leg_compliance_bait": "Fake compliance or policy update.",
+    "leg_authority_impersonation": "Fake government or legal authority.",
+    "nws_fake_breaking_news": "Fabricated urgent news.",
+    "nws_clickbait_headline": "Outrage or curiosity headline.",
+    "nws_confirmation_bias": "Reinforces beliefs deceptively.",
+    "nws_share_amplification": "Urges forwarding or sharing.",
+    "per_romance_manipulation": "Fake relationship manipulation.",
+    "per_grief_crisis_exploit": "Grief or crisis exploitation.",
+    "per_shame_extortion": "Shame, blackmail, or sextortion.",
+    "per_savior_bait": "Urgent appeal to save or help someone.",
+    "urgency_pressure": "Deadline or immediate action pressure.",
+    "fear_threat": "Threat, consequence, danger, or punishment.",
+    "guilt_shame": "Obligation, blame, or shame pressure.",
+    "greed_reward": "Prize, gain, refund, or reward.",
+    "social_proof": "Claims others already did it.",
+    "reciprocity": "Suggests the user owes something back.",
+    "curiosity_bait": "Pushes the user to click to see hidden information.",
+    "false_scarcity": "Limited availability or countdown pressure.",
+    "personalization": "Uses personal details to increase credibility.",
+    "emotional_exploitation": "Leverages emotions to influence action.",
+    "credential_harvest": "Attempts to steal login, password, MFA, or OTP information.",
+    "financial_fraud": "Payment, wire, invoice, or gift card scam.",
+    "malware_delivery": "Attempts to deliver malicious attachment or download.",
+    "data_exfiltration": "Attempts to collect sensitive data.",
+    "account_takeover": "Attempts account access or session compromise.",
+    "identity_theft": "Collects identity information.",
+    "disinformation": "Spreads false information.",
+    "behavioral_manipulation": "Deceptively influences user action.",
+    "extortion_blackmail": "Uses threats for compliance or payment.",
+    "spoofed_sender": "Sender mismatch or impersonation.",
+    "lookalike_domain": "Fake domain mimicking a real one.",
+    "auth_fail": "SPF, DKIM, or DMARC failure.",
+    "suspicious_url": "Risky, mismatched, or action link.",
+    "risky_attachment": "Executable, macro, or suspicious file.",
+    "thread_hijack": "Inserted into an existing thread."
+}
+
+
 def clean_json_response(response):
     response = response.strip()
 
@@ -40,15 +113,9 @@ def clean_json_response(response):
 
 
 def extract_label_objects(response):
-    """
-    Backup parser for when the model starts valid JSON
-    but over-generates or gets cut off.
-    """
-
     objects = []
 
-    pattern = r'\{\s*"risk_tier"\s*:\s*.*?"tags"\s*:\s*\{\s*"layer_2"\s*:\s*\[.*?\]\s*,\s*"layer_3"\s*:\s*\[.*?\]\s*,\s*"layer_4"\s*:\s*\[.*?\]\s*,\s*"layer_5"\s*:\s*\[.*?\]\s*\}\s*\}'
-
+    pattern = r'\{\s*"risk_tier"\s*:\s*.*?"tags"\s*:\s*\{.*?\}\s*\}'
     matches = re.findall(pattern, response, re.DOTALL)
 
     for match in matches:
@@ -60,11 +127,67 @@ def extract_label_objects(response):
     return objects
 
 
+def normalize_tag_item(item):
+    if isinstance(item, dict):
+        tag_name = item.get("tag", "")
+
+        return {
+            "tag": tag_name,
+            "description": item.get("description") or TAG_DESCRIPTIONS.get(tag_name, ""),
+            "reason": item.get("reason", "")
+        }
+
+    tag_name = str(item)
+
+    return {
+        "tag": tag_name,
+        "description": TAG_DESCRIPTIONS.get(tag_name, ""),
+        "reason": ""
+    }
+
+
+def normalize_result_objects(result):
+    cleaned = []
+
+    for label in result:
+        risk_tier = label.get("risk_tier", "tier_1_benign")
+        domain_tag = label.get("domain_tag", "technology")
+        risk_summary = label.get("risk_summary", "No summary returned.")
+
+        tags = label.get("tags", {})
+
+        cleaned.append({
+            "risk_tier": risk_tier,
+            "domain_tag": domain_tag,
+            "risk_summary": risk_summary,
+            "tags": {
+                "layer_2": [
+                    normalize_tag_item(item)
+                    for item in tags.get("layer_2", [])
+                ],
+                "layer_3": [
+                    normalize_tag_item(item)
+                    for item in tags.get("layer_3", [])
+                ],
+                "layer_4": [
+                    normalize_tag_item(item)
+                    for item in tags.get("layer_4", [])
+                ],
+                "layer_5": [
+                    normalize_tag_item(item)
+                    for item in tags.get("layer_5", [])
+                ],
+            }
+        })
+
+    return cleaned
+
+
 def analyze_email(email_input):
     email_text = json.dumps(email_input["emails"], indent=2)
 
     prompt = f"""
-You are labeling emails for a cybersecurity social engineering dataset.
+You are labeling emails for a cybersecurity social engineering demo portal.
 
 You will receive a small batch of email objects.
 
@@ -88,7 +211,12 @@ For each email:
 2. Choose exactly one risk_tier.
 3. Choose exactly one domain_tag.
 4. Choose any supported layer tags from layer_2, layer_3, layer_4, and layer_5.
-5. Leave a layer array empty only when no valid tag from that layer fits the email.
+5. For each selected tag, include:
+   - tag
+   - description
+   - reason
+6. Write a short risk_summary for the email in normal user-friendly language.
+7. Leave a layer array empty only when no valid tag from that layer fits the email.
 
 Return one label object per input email.
 Return labels in the same order as the input emails.
@@ -98,7 +226,7 @@ OUTPUT FORMAT
 Return only valid JSON.
 Return a JSON array.
 Do not include markdown.
-Do not include explanations.
+Do not include explanations outside the JSON.
 Do not include email_1, email_2, or any invented domain names.
 
 The output array length must equal the number of input email objects.
@@ -113,8 +241,15 @@ Each output object must follow this exact shape:
   {{
     "risk_tier": "tier_1_benign",
     "domain_tag": "technology",
+    "risk_summary": "This email appears to be a normal account notification with no strong social engineering pressure.",
     "tags": {{
-      "layer_2": [],
+      "layer_2": [
+        {{
+          "tag": "tec_account_takeover_bait",
+          "description": "Fake login, OTP, or account alert.",
+          "reason": "The message asks the user to respond to an account access issue."
+        }}
+      ],
       "layer_3": [],
       "layer_4": [],
       "layer_5": []
@@ -240,7 +375,7 @@ INPUT EMAILS
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=900,
+            max_new_tokens=1400,
             do_sample=False,
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.eos_token_id
@@ -267,4 +402,4 @@ INPUT EMAILS
     expected_count = len(email_input["emails"])
     result = result[:expected_count]
 
-    return result
+    return normalize_result_objects(result)
